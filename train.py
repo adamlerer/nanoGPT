@@ -21,13 +21,18 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import datetime
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import torch.nn.functional as F
 
 from model import GPTConfig, GPT
+
+def log(msg):
+    print(f"{datetime.datetime.now()}: {msg}", flush=True)
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -48,6 +53,7 @@ dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+batch_blocks = False  # batch on block boundaries
 # model
 n_layer = 12
 n_head = 12
@@ -77,6 +83,9 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+def ppl(loss):
+    return math.e ** loss
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -115,9 +124,13 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+batches_per_epoch = len(train_data) / block_size / batch_size
 def get_batch(split):
     data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    if batch_blocks:
+        ix = torch.randint(len(data) // block_size - 1, (batch_size,)) * block_size
+    else:
+        ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
@@ -259,7 +272,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        log(f"step {iter_num}: train ppl {ppl(losses['train']):.4f}, val ppl {ppl(losses['val']):.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -295,6 +308,7 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
+            last_targets = Y  # need this for logging, since we start prefetch before logging!
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -321,7 +335,15 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if iter_num == 0:
+            log(f"First tokens: {X[:4, :2]}")
+        # Compute ppl on first and second half of input
+        per_token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), last_targets.view(-1), ignore_index=-1, reduction='none').view(*last_targets.shape).to(torch.float32)
+        B, S = per_token_loss.shape
+        assert B == batch_size, (B, batch_size)
+        assert S == block_size, (S, block_size)
+
+        log(f"iter {iter_num} [{iter_num / batches_per_epoch:.2f} epochs]: loss {lossf:.4f} = [ {per_token_loss[:, :S//2].mean():.4f} | {per_token_loss[:, S//2:].mean():.4f} ] ppl {ppl(lossf):.4f} = [ {ppl(per_token_loss[:, :S//2].mean()):.4f} | {ppl(per_token_loss[:, S//2:].mean()):.4f} ], time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
